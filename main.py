@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from src.utils.requests import PassengerData
 from src.utils.response import PredictionResponse
-from src.utils.config import APP_NAME, VERSION, API_SECRET_KEY, supabase
+from src.utils.config import APP_NAME, VERSION, API_SECRET_KEY, supabase, LogsUnavailableError
 from src.utils.inference import predict_survival
 
 app = FastAPI(title=APP_NAME, version=VERSION)
@@ -43,17 +43,35 @@ async def classify(passengers: List[PassengerData], api_key: str = Depends(verif
         raise HTTPException(status_code=500, detail=f"Error making predictions: {str(e)}")
 
 
-@app.get('/logs', tags=['analytics'])
-async def get_logs(limit: int = 100, api_key: str = Depends(verify_api_key)):
+def _query_logs(limit: int):
+    """
+    Wraps a raw Supabase query and converts any failure (timeout,
+    connection error -- typically a paused/sleeping project) into
+    LogsUnavailableError, so callers never need to know about
+    Supabase-specific exception types.
+    """
     try:
-        result = (
+        return (
             supabase.table("api_logs")
             .select("*")
             .order("created_at", desc=True)
             .limit(limit)
             .execute()
         )
+    except Exception as e:
+        raise LogsUnavailableError from e
+
+
+@app.get('/logs', tags=['analytics'])
+async def get_logs(limit: int = 100, api_key: str = Depends(verify_api_key)):
+    try:
+        result = _query_logs(limit)
         return {"logs": result.data}
+    except LogsUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail="Logs service is temporarily unavailable (database unreachable). Please try again shortly.",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error fetching logs: {str(e)}")
 
@@ -92,13 +110,17 @@ async def get_logs_summary(api_key: str = Depends(verify_api_key)):
     - cumulative requests series (same buckets)
     """
     try:
-        result = (
-            supabase.table("api_logs")
-            .select("*")
-            .order("created_at", desc=False)
-            .limit(5000)
-            .execute()
-        )
+        try:
+            result = (
+                supabase.table("api_logs")
+                .select("*")
+                .order("created_at", desc=False)
+                .limit(5000)
+                .execute()
+            )
+        except Exception as e:
+            raise LogsUnavailableError from e
+
         rows = result.data
 
         if not rows:
@@ -156,5 +178,10 @@ async def get_logs_summary(api_key: str = Depends(verify_api_key)):
             "requests_over_time": requests_over_time,
             "cumulative_requests": cumulative_requests,
         }
+    except LogsUnavailableError:
+        raise HTTPException(
+            status_code=503,
+            detail="Logs service is temporarily unavailable (database unreachable). Please try again shortly.",
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error building logs summary: {str(e)}")
